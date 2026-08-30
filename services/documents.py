@@ -119,6 +119,34 @@ def to_xliff(file_bytes: bytes, filename: str, src_lang: str, tgt_lang: str) -> 
     return _build_xliff(pairs, src_lang, tgt_lang, original=filename)
 
 
+def parse_reference_chunks(content: bytes, filename: str) -> List[str]:
+    """Parse a target-language reference document into text chunks for the
+    semantic style matcher. TXT / DOCX / PDF; ignores very short lines."""
+    ext = ext_of(filename)
+    chunks: List[str] = []
+    try:
+        if ext == ".txt":
+            for ln in _decode(content).replace("\r\n", "\n").split("\n"):
+                ln = ln.strip()
+                if len(ln) > 15:
+                    chunks.append(ln)
+        elif ext == ".docx":
+            import docx
+            for p in docx.Document(io.BytesIO(content)).paragraphs:
+                if len(p.text.strip()) > 15:
+                    chunks.append(p.text.strip())
+        elif ext == ".pdf":
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                for page in pdf.pages:
+                    for ln in (page.extract_text() or "").split("\n"):
+                        if len(ln.strip()) > 15:
+                            chunks.append(ln.strip())
+    except Exception:
+        pass
+    return chunks
+
+
 def rebuild(translations: Dict[str, str], original_bytes: bytes, filename: str) -> Tuple[bytes, str]:
     """Write translations back into a copy of the original document. Returns
     (bytes, output_filename)."""
