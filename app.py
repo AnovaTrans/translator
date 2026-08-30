@@ -14,6 +14,7 @@ import model_utils
 from anova_brand_theme import apply_anova_theme, anova_header, anova_footer, anova_sidebar_logo
 from utils.xml_parser import XMLParser
 from services.orchestrator import translate
+from services import documents
 
 st.set_page_config(page_title="Anova Translator", page_icon="🌐",
                    layout="wide", initial_sidebar_state="expanded")
@@ -96,8 +97,12 @@ anova_header("Translator", "AI translation with Translation Memory (TMX) + Termb
 
 c1, c2 = st.columns(2)
 with c1:
-    xliff_file = st.file_uploader("XLIFF to translate (required)",
-                                  type=["xliff", "xlf", "mqxliff", "sdlxliff", "xml"])
+    in_file = st.file_uploader(
+        "File to translate — XLIFF or a document (required)",
+        type=["xliff", "xlf", "mqxliff", "sdlxliff", "xml", "docx", "txt"],
+        help="XLIFF/XLF for CAT round-trip, or a DOCX/TXT document (converted to "
+             "XLIFF internally and rebuilt to its original format after translation).",
+    )
 with c2:
     tmx_file = st.file_uploader("Translation Memory — TMX (optional)", type=["tmx"])
 
@@ -107,15 +112,32 @@ with c3:
 with c4:
     dnt_file = st.file_uploader("Do-Not-Translate list (optional)", type=["txt", "csv"])
 
+is_doc = bool(in_file) and documents.is_document(in_file.name)
+
+# Languages: auto-detected from an XLIFF header; chosen by the user for documents.
 src_code, tgt_code = "en", "tr"
-if xliff_file:
-    src_code, tgt_code = _detect_langs(xliff_file.getvalue())
-    st.info(f"Detected: **{config.SUPPORTED_LANGUAGES.get(src_code, src_code)}** → "
-            f"**{config.SUPPORTED_LANGUAGES.get(tgt_code, tgt_code)}**")
+if in_file and not is_doc:
+    src_code, tgt_code = _detect_langs(in_file.getvalue())
+
+_lang_codes = list(config.SUPPORTED_LANGUAGES.keys())
+_fmt = lambda c: f"{c} — {config.SUPPORTED_LANGUAGES.get(c, c)}"
+lc1, lc2 = st.columns(2)
+with lc1:
+    src_code = st.selectbox("Source language", _lang_codes,
+                            index=_lang_codes.index(src_code) if src_code in _lang_codes else 0,
+                            format_func=_fmt, disabled=(bool(in_file) and not is_doc))
+with lc2:
+    tgt_code = st.selectbox("Target language", _lang_codes,
+                            index=_lang_codes.index(tgt_code) if tgt_code in _lang_codes else 0,
+                            format_func=_fmt, disabled=(bool(in_file) and not is_doc))
+if in_file and not is_doc:
+    st.caption("Languages auto-detected from the XLIFF header.")
+elif is_doc:
+    st.caption(f"📄 Document mode: **{in_file.name}** → translated & rebuilt to its original format.")
 
 running = st.session_state.get("tr_running", False)
 go = st.button("🚀 Translate", type="primary", use_container_width=True,
-               disabled=running or xliff_file is None)
+               disabled=running or in_file is None)
 
 if go and not running:
     if not api_key:
@@ -124,7 +146,9 @@ if go and not running:
         st.session_state.tr_running = True
         st.session_state.pop("tr_result", None)
         st.session_state._pending = {
-            "xliff": xliff_file.getvalue(),
+            "original": in_file.getvalue(),
+            "filename": in_file.name,
+            "is_doc": is_doc,
             "tmx": tmx_file.getvalue() if tmx_file else None,
             "csv": csv_file.getvalue() if csv_file else None,
             "dnt": _read_dnt(dnt_file) if dnt_file else None,
@@ -145,8 +169,14 @@ if st.session_state.get("tr_running"):
         bar.progress(min(frac, 1.0), text=f"{stage}: {msg} ({done}/{total})")
 
     try:
+        # Documents are converted to XLIFF first; XLIFF/XLF are used as-is.
+        if p["is_doc"]:
+            xliff_in = documents.to_xliff(p["original"], p["filename"], p["src"], p["tgt"])
+        else:
+            xliff_in = p["original"]
+
         res = translate(
-            p["xliff"], provider=p["provider"], api_key=p["api_key"], model=p["model"],
+            xliff_in, provider=p["provider"], api_key=p["api_key"], model=p["model"],
             src_code=p["src"], tgt_code=p["tgt"],
             tmx_bytes=p["tmx"], csv_bytes=p["csv"], dnt_terms=p["dnt"],
             run_qa=p["run_qa"],
@@ -155,10 +185,15 @@ if st.session_state.get("tr_running"):
             progress_cb=_cb,
         )
         seg_map = {s.id: s for s in res["segments"]}
-        out_xliff = XMLParser.update_xliff(p["xliff"], res["translations"], seg_map)
+        out_xliff = XMLParser.update_xliff(xliff_in, res["translations"], seg_map)
+
+        doc_bytes, doc_name = (None, None)
+        if p["is_doc"]:
+            doc_bytes, doc_name = documents.rebuild(res["translations"], p["original"], p["filename"])
+
         st.session_state.tr_result = {
-            "xliff": out_xliff, "log": res["log"], "stats": res["stats"],
-            "qa": res["qa_errors"],
+            "xliff": out_xliff, "doc_bytes": doc_bytes, "doc_name": doc_name,
+            "log": res["log"], "stats": res["stats"], "qa": res["qa_errors"],
         }
     except Exception as e:
         st.session_state.tr_error = str(e)
@@ -180,13 +215,19 @@ if r:
     m3.metric("Fresh LLM", s["fresh"])
     m4.metric("TB-demoted", s["demoted"])
 
-    d1, d2 = st.columns(2)
-    d1.download_button("⬇️ Download translated XLIFF", data=r["xliff"],
-                       file_name="translated.xliff", mime="application/xml",
-                       use_container_width=True)
-    d2.download_button("📋 Download log", data=r["log"],
-                       file_name="translation_log.txt", mime="text/plain",
-                       use_container_width=True)
+    cols = st.columns(3 if r.get("doc_bytes") else 2)
+    ci = 0
+    if r.get("doc_bytes"):
+        cols[ci].download_button("⬇️ Download translated document", data=r["doc_bytes"],
+                                 file_name=r["doc_name"], use_container_width=True)
+        ci += 1
+    cols[ci].download_button("⬇️ Download translated XLIFF", data=r["xliff"],
+                             file_name="translated.xliff", mime="application/xml",
+                             use_container_width=True)
+    ci += 1
+    cols[ci].download_button("📋 Download log", data=r["log"],
+                             file_name="translation_log.txt", mime="text/plain",
+                             use_container_width=True)
 
     if r["qa"]:
         st.subheader(f"🔎 QA — {len(r['qa'])} issue(s)")
